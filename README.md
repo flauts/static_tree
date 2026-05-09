@@ -1,4 +1,7 @@
 # static_tree
+Integrantes:
+- Sebastian Nieto Paz
+- Matias Meneses Roncal
 
 Implementacion para comparar:
 
