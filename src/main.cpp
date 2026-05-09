@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -13,6 +14,7 @@
 #include <vector>
 
 using Clock = std::chrono::steady_clock;
+static constexpr uint32_t NIL = std::numeric_limits<uint32_t>::max();
 
 struct Config {
     std::size_t n = 1000000;
@@ -115,10 +117,223 @@ static double elapsed_ms(Clock::time_point begin, Clock::time_point end) {
     return std::chrono::duration<double, std::milli>(end - begin).count();
 }
 
+class PointerBST {
+public:
+    struct Node {
+        int32_t key;
+        Node* left = nullptr;
+        Node* right = nullptr;
+    };
+
+    void build(const std::vector<int32_t>& sorted_values) {
+        nodes.clear();
+        nodes.reserve(sorted_values.size());
+        root = build_rec(sorted_values, 0, sorted_values.size());
+    }
+
+    bool contains(int32_t key) const {
+        Node* cur = root;
+        while (cur != nullptr) {
+            if (key == cur->key) {
+                return true;
+            }
+            cur = (key < cur->key) ? cur->left : cur->right;
+        }
+        return false;
+    }
+
+private:
+    Node* root = nullptr;
+    std::vector<std::unique_ptr<Node>> nodes;
+
+    Node* make_node(int32_t key) {
+        nodes.push_back(std::make_unique<Node>());
+        nodes.back()->key = key;
+        return nodes.back().get();
+    }
+
+    Node* build_rec(const std::vector<int32_t>& values, std::size_t lo, std::size_t hi) {
+        if (lo >= hi) {
+            return nullptr;
+        }
+        std::size_t mid = lo + (hi - lo) / 2;
+        Node* node = make_node(values[mid]);
+        node->left = build_rec(values, lo, mid);
+        node->right = build_rec(values, mid + 1, hi);
+        return node;
+    }
+};
+
+class StaticTree {
+public:
+    struct Node {
+        int32_t key = 0;
+        uint32_t left = NIL;
+        uint32_t right = NIL;
+    };
+
+    void build(const std::vector<int32_t>& sorted_values) {
+        logical.clear();
+        logical.reserve(sorted_values.size());
+        int root = build_logical(sorted_values, 0, sorted_values.size());
+
+        std::vector<int> order;
+        order.reserve(logical.size());
+        layout_veb(root, tree_height(root), order);
+        if (order.size() != logical.size()) {
+            throw std::runtime_error("fallo construyendo el layout del static tree");
+        }
+
+        std::vector<uint32_t> pos(logical.size(), NIL);
+        nodes.assign(order.size(), Node{});
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            pos[order[i]] = static_cast<uint32_t>(i);
+            nodes[i].key = logical[order[i]].key;
+        }
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            const LogicalNode& old = logical[order[i]];
+            nodes[i].left = (old.left < 0) ? NIL : pos[old.left];
+            nodes[i].right = (old.right < 0) ? NIL : pos[old.right];
+        }
+    }
+
+    bool contains(int32_t key) const {
+        uint32_t cur = nodes.empty() ? NIL : 0;
+        while (cur != NIL) {
+            const Node& node = nodes[cur];
+            if (key == node.key) {
+                return true;
+            }
+            cur = (key < node.key) ? node.left : node.right;
+        }
+        return false;
+    }
+
+    std::size_t bytes_used() const {
+        return nodes.size() * sizeof(Node);
+    }
+
+private:
+    struct LogicalNode {
+        int32_t key = 0;
+        int left = -1;
+        int right = -1;
+    };
+
+    std::vector<LogicalNode> logical;
+    std::vector<Node> nodes;
+
+    int build_logical(const std::vector<int32_t>& values, std::size_t lo, std::size_t hi) {
+        if (lo >= hi) {
+            return -1;
+        }
+        std::size_t mid = lo + (hi - lo) / 2;
+        int id = static_cast<int>(logical.size());
+        logical.push_back(LogicalNode{values[mid], -1, -1});
+        logical[id].left = build_logical(values, lo, mid);
+        logical[id].right = build_logical(values, mid + 1, hi);
+        return id;
+    }
+
+    int tree_height(int id) const {
+        if (id < 0) {
+            return 0;
+        }
+        int lh = tree_height(logical[id].left);
+        int rh = tree_height(logical[id].right);
+        return 1 + std::max(lh, rh);
+    }
+
+    void collect_depth(int id, int depth, std::vector<int>& out) const {
+        if (id < 0) {
+            return;
+        }
+        if (depth == 0) {
+            out.push_back(id);
+            return;
+        }
+        collect_depth(logical[id].left, depth - 1, out);
+        collect_depth(logical[id].right, depth - 1, out);
+    }
+
+    void layout_veb(int id, int height, std::vector<int>& out) const {
+        if (id < 0 || height <= 0) {
+            return;
+        }
+        if (height == 1) {
+            out.push_back(id);
+            return;
+        }
+
+        int top_height = (height + 1) / 2;
+        layout_veb(id, top_height, out);
+
+        std::vector<int> bottom_roots;
+        bottom_roots.reserve(1u << std::min(top_height, 20));
+        collect_depth(id, top_height, bottom_roots);
+        for (int child_root : bottom_roots) {
+            layout_veb(child_root, height - top_height, out);
+        }
+    }
+};
+
+template <class Tree>
+static std::size_t run_queries(const Tree& tree, const std::vector<int32_t>& queries) {
+    std::size_t found = 0;
+    for (int32_t key : queries) {
+        found += tree.contains(key) ? 1u : 0u;
+    }
+    return found;
+}
+
+struct Measurement {
+    double build_ms = 0.0;
+    double query_ms = 0.0;
+    std::size_t found = 0;
+};
+
+static void ensure_parent_dir(const std::string& file) {
+    std::filesystem::path path(file);
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(path.parent_path());
+    }
+}
+
+static void write_row(
+    std::ofstream& csv,
+    const std::string& trial,
+    const Config& cfg,
+    const std::string& structure,
+    const Measurement& m
+) {
+    double ns_per_query = (m.query_ms * 1000000.0) / static_cast<double>(cfg.queries);
+    csv << trial << ','
+        << cfg.n << ','
+        << cfg.queries << ','
+        << cfg.block_size << ','
+        << structure << ','
+        << std::fixed << std::setprecision(3) << m.build_ms << ','
+        << m.query_ms << ','
+        << ns_per_query << ','
+        << m.found << ','
+        << std::thread::hardware_concurrency() << ','
+        << (8 * sizeof(void*)) << ','
+        << '"' << __VERSION__ << '"'
+        << '\n';
+}
+
 int main(int argc, char** argv) {
     try {
         Config cfg = parse_args(argc, argv);
         std::vector<int32_t> values = make_elements(cfg.n);
+        ensure_parent_dir(cfg.out);
+
+        std::ofstream csv(cfg.out);
+        if (!csv) {
+            throw std::runtime_error("no se pudo abrir el csv de salida");
+        }
+        csv << "trial,n,queries,block_size,structure,build_ms,query_ms,"
+            << "ns_per_query,found,hardware_threads,pointer_bits,compiler\n";
 
         std::cout << "n=" << cfg.n
                   << " queries=" << cfg.queries
@@ -127,15 +342,69 @@ int main(int argc, char** argv) {
         std::cout << "hardware_threads=" << std::thread::hardware_concurrency()
                   << " int_bits=32 pointer_bits=" << (8 * sizeof(void*)) << "\n";
 
+        Measurement static_sum;
+        Measurement bst_sum;
+
         for (int trial = 1; trial <= cfg.trials; ++trial) {
-            auto t0 = Clock::now();
             std::vector<int32_t> queries = make_queries(values, cfg.queries, cfg.seed + trial);
-            auto t1 = Clock::now();
+
+            StaticTree static_tree;
+            auto begin = Clock::now();
+            static_tree.build(values);
+            auto end = Clock::now();
+            Measurement static_m;
+            static_m.build_ms = elapsed_ms(begin, end);
+
+            begin = Clock::now();
+            static_m.found = run_queries(static_tree, queries);
+            end = Clock::now();
+            static_m.query_ms = elapsed_ms(begin, end);
+
+            PointerBST bst;
+            begin = Clock::now();
+            bst.build(values);
+            end = Clock::now();
+            Measurement bst_m;
+            bst_m.build_ms = elapsed_ms(begin, end);
+
+            begin = Clock::now();
+            bst_m.found = run_queries(bst, queries);
+            end = Clock::now();
+            bst_m.query_ms = elapsed_ms(begin, end);
+
+            if (static_m.found != bst_m.found) {
+                throw std::runtime_error("los arboles no devolvieron las mismas respuestas");
+            }
+
+            static_sum.build_ms += static_m.build_ms;
+            static_sum.query_ms += static_m.query_ms;
+            static_sum.found += static_m.found;
+            bst_sum.build_ms += bst_m.build_ms;
+            bst_sum.query_ms += bst_m.query_ms;
+            bst_sum.found += bst_m.found;
+
+            write_row(csv, std::to_string(trial), cfg, "cache_oblivious_static_tree", static_m);
+            write_row(csv, std::to_string(trial), cfg, "pointer_bst", bst_m);
 
             std::cout << "trial " << trial
-                      << ": generated queries in " << std::fixed << std::setprecision(2)
-                      << elapsed_ms(t0, t1) << " ms\n";
+                      << " static=" << std::fixed << std::setprecision(2) << static_m.query_ms
+                      << " ms bst=" << bst_m.query_ms
+                      << " ms found=" << static_m.found
+                      << " static_bytes=" << static_tree.bytes_used()
+                      << "\n";
         }
+
+        static_sum.build_ms /= cfg.trials;
+        static_sum.query_ms /= cfg.trials;
+        static_sum.found /= static_cast<std::size_t>(cfg.trials);
+        bst_sum.build_ms /= cfg.trials;
+        bst_sum.query_ms /= cfg.trials;
+        bst_sum.found /= static_cast<std::size_t>(cfg.trials);
+
+        write_row(csv, "avg", cfg, "cache_oblivious_static_tree", static_sum);
+        write_row(csv, "avg", cfg, "pointer_bst", bst_sum);
+
+        std::cout << "resultados guardados en " << cfg.out << "\n";
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         usage(argv[0]);
